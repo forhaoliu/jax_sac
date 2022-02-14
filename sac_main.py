@@ -59,7 +59,7 @@ def main(argv):
     log_dir = Path(tempfile.mkdtemp())
     wandb.init(
         config=copy(variant),
-        project="BigAPT",
+        project="SAC",
         dir=log_dir,
         id=uuid.uuid4().hex,
         mode="online" if FLAGS.online else "offline",
