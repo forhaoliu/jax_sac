@@ -39,23 +39,6 @@ class SAC:
 
     def update_default_config(self, updates):
         self.config = self.get_default_config(updates)
-        HashableConfig = namedtuple(
-            "HashableConfig",
-            [
-                "use_automatic_entropy_tuning",
-                "target_entropy",
-                "alpha_multiplier",
-                "backup_entropy",
-                "soft_target_update_rate",
-            ],
-        )
-        self._hashable_config = HashableConfig(
-            self.config.use_automatic_entropy_tuning,
-            self.config.target_entropy,
-            self.config.alpha_multiplier,
-            self.config.backup_entropy,
-            self.config.soft_target_update_rate,
-        )
 
     def create_state(self, policy, qf, observation_dim, action_dim, rng):
         state = {}
@@ -116,126 +99,120 @@ class SAC:
     def train(self, state, batch, rng):
         rng = shard_prng_key(rng)
         batch = jax.tree_map(shard, batch)
-        target_qf_params = jax_utils.replicate(self._target_qf_params)
 
-        state, metrics, rng = train_step(
-            state, rng, batch, target_qf_params, self._hashable_config, self._model_keys
+        state, metrics, rng, self._target_qf_params = self.train_step(
+            state, rng, batch, self._target_qf_params, self._model_keys
         )
-
-        single_state = jax_utils.unreplicate(state)
-        new_target_qf_params = {}
-        new_target_qf_params["qf1"] = update_target_network(
-            single_state["qf1"].params,
-            self._target_qf_params["qf1"],
-            self._hashable_config.soft_target_update_rate,
-        )
-        new_target_qf_params["qf2"] = update_target_network(
-            single_state["qf2"].params,
-            self._target_qf_params["qf2"],
-            self._hashable_config.soft_target_update_rate,
-        )
-        self._target_qf_params = new_target_qf_params
 
         metrics = jax_utils.unreplicate(metrics)
         rng = jax_utils.unreplicate(rng)
 
-        return state, rng, {key: val.item() for key, val in metrics.items()}
+        return state, rng, metrics
 
+    @partial(jax.pmap, axis_name="batch")
+    def train_step(self, state, rng, batch, target_qf_params, model_keys):
+        def loss_fn(params, rng):
+            obs = batch["obs"]
+            action = batch["action"]
+            reward = jnp.squeeze(batch["reward"], axis=1)
+            discount = jnp.squeeze(batch["discount"], axis=1)
+            next_obs = batch["next_obs"]
 
-@partial(jax.pmap, static_broadcasted_argnums=(4, 5), axis_name="batch")
-def train_step(state, rng, batch, target_qf_params, train_config, model_keys):
-    def loss_fn(params, rng):
-        obs = batch["obs"]
-        action = batch["action"]
-        reward = jnp.squeeze(batch["reward"], axis=1)
-        discount = jnp.squeeze(batch["discount"], axis=1)
-        next_obs = batch["next_obs"]
+            loss = {}
 
-        loss = {}
+            rng, split_rng = jax.random.split(rng)
+            new_action, log_pi = state["policy"].apply_fn(
+                params["policy"], split_rng, obs
+            )
+
+            if self.config.use_automatic_entropy_tuning:
+                alpha_loss = (
+                    -state["log_alpha"].apply_fn(params["log_alpha"])
+                    * (log_pi + self.config.target_entropy).mean()
+                )
+                loss["log_alpha"] = alpha_loss
+                alpha = (
+                    jnp.exp(state["log_alpha"].apply_fn(params["log_alpha"]))
+                    * self.config.alpha_multiplier
+                )
+            else:
+                alpha_loss = 0.0
+                alpha = self.config.alpha_multiplier
+
+            """ Policy loss """
+            q_new_action = jnp.minimum(
+                state["qf1"].apply_fn(params["qf1"], obs, new_action),
+                state["qf2"].apply_fn(params["qf2"], obs, new_action),
+            )
+            policy_loss = (alpha * log_pi - q_new_action).mean()
+
+            loss["policy"] = policy_loss
+
+            """ Q function loss """
+            q1_pred = state["qf1"].apply_fn(params["qf1"], obs, action)
+            q2_pred = state["qf2"].apply_fn(params["qf2"], obs, action)
+
+            rng, split_rng = jax.random.split(rng)
+            new_next_action, next_log_pi = state["policy"].apply_fn(
+                params["policy"], split_rng, next_obs
+            )
+            target_q_values = jnp.minimum(
+                state["qf1"].apply_fn(
+                    target_qf_params["qf1"], next_obs, new_next_action
+                ),
+                state["qf2"].apply_fn(
+                    target_qf_params["qf2"], next_obs, new_next_action
+                ),
+            )
+
+            if self.config.backup_entropy:
+                target_q_values = target_q_values - alpha * next_log_pi
+
+            q_target = jax.lax.stop_gradient(reward + discount * target_q_values)
+            qf1_loss = mse_loss(q1_pred, q_target)
+            qf2_loss = mse_loss(q2_pred, q_target)
+
+            loss["qf1"] = qf1_loss
+            loss["qf2"] = qf2_loss
+
+            return tuple(loss[key] for key in model_keys), locals()
 
         rng, split_rng = jax.random.split(rng)
-        new_action, log_pi = state["policy"].apply_fn(
-            params["policy"], split_rng, obs
+
+        params = {key: state[key].params for key in model_keys}
+        (_, aux_values), grads = value_and_multi_grad(
+            loss_fn, len(model_keys), has_aux=True
+        )(params, split_rng)
+        grads = jax.lax.pmean(grads, "batch")
+
+        state = {
+            key: state[key].apply_gradients(grads=grads[i][key])
+            for i, key in enumerate(model_keys)
+        }
+
+        new_target_qf_params = {}
+        new_target_qf_params['qf1'] = update_target_network(
+            state['qf1'].params, target_qf_params['qf1'],
+            self.config.soft_target_update_rate
+        )
+        new_target_qf_params['qf2'] = update_target_network(
+            state['qf2'].params, target_qf_params['qf2'],
+            self.config.soft_target_update_rate
         )
 
-        if train_config.use_automatic_entropy_tuning:
-            alpha_loss = (
-                -state["log_alpha"].apply_fn(params["log_alpha"])
-                * (log_pi + train_config.target_entropy).mean()
-            )
-            loss["log_alpha"] = alpha_loss
-            alpha = (
-                jnp.exp(state["log_alpha"].apply_fn(params["log_alpha"]))
-                * train_config.alpha_multiplier
-            )
-        else:
-            alpha_loss = 0.0
-            alpha = train_config.alpha_multiplier
-
-        """ Policy loss """
-        q_new_action = jnp.minimum(
-            state["qf1"].apply_fn(params["qf1"], obs, new_action),
-            state["qf2"].apply_fn(params["qf2"], obs, new_action),
-        )
-        policy_loss = (alpha * log_pi - q_new_action).mean()
-
-        loss["policy"] = policy_loss
-
-        """ Q function loss """
-        q1_pred = state["qf1"].apply_fn(params["qf1"], obs, action)
-        q2_pred = state["qf2"].apply_fn(params["qf2"], obs, action)
-
-        rng, split_rng = jax.random.split(rng)
-        new_next_action, next_log_pi = state["policy"].apply_fn(
-            params["policy"], split_rng, next_obs
-        )
-        target_q_values = jnp.minimum(
-            state["qf1"].apply_fn(
-                target_qf_params["qf1"], next_obs, new_next_action
+        metrics = jax.lax.pmean(
+            dict(
+                log_pi=aux_values["log_pi"].mean(),
+                policy_loss=aux_values["policy_loss"],
+                qf1_loss=aux_values["qf1_loss"],
+                qf2_loss=aux_values["qf2_loss"],
+                alpha_loss=aux_values["alpha_loss"],
+                alpha=aux_values["alpha"],
+                average_qf1=aux_values["q1_pred"].mean(),
+                average_qf2=aux_values["q2_pred"].mean(),
+                average_target_q=aux_values["target_q_values"].mean(),
             ),
-            state["qf2"].apply_fn(
-                target_qf_params["qf2"], next_obs, new_next_action
-            ),
+            axis_name="batch",
         )
 
-        if train_config.backup_entropy:
-            target_q_values = target_q_values - alpha * next_log_pi
-
-        q_target = jax.lax.stop_gradient(reward + discount * target_q_values)
-        qf1_loss = mse_loss(q1_pred, q_target)
-        qf2_loss = mse_loss(q2_pred, q_target)
-
-        loss["qf1"] = qf1_loss
-        loss["qf2"] = qf2_loss
-
-        return tuple(loss[key] for key in model_keys), locals()
-
-    rng, split_rng = jax.random.split(rng)
-
-    params = {key: state[key].params for key in model_keys}
-    (_, aux_values), grads = value_and_multi_grad(
-        loss_fn, len(model_keys), has_aux=True
-    )(params, split_rng)
-    grads = jax.lax.pmean(grads, "batch")
-
-    state = {
-        key: state[key].apply_gradients(grads=grads[i][key])
-        for i, key in enumerate(model_keys)
-    }
-
-    metrics = jax.lax.pmean(
-        dict(
-            log_pi=aux_values["log_pi"].mean(),
-            policy_loss=aux_values["policy_loss"],
-            qf1_loss=aux_values["qf1_loss"],
-            qf2_loss=aux_values["qf2_loss"],
-            alpha_loss=aux_values["alpha_loss"],
-            alpha=aux_values["alpha"],
-            average_qf1=aux_values["q1_pred"].mean(),
-            average_qf2=aux_values["q2_pred"].mean(),
-            average_target_q=aux_values["target_q_values"].mean(),
-        ),
-        axis_name="batch",
-    )
-
-    return state, metrics, rng
+        return state, metrics, rng, new_target_qf_params
