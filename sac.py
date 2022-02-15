@@ -10,7 +10,6 @@ from flax import jax_utils
 from flax.training.common_utils import shard, shard_prng_key
 from flax.training.train_state import TrainState
 from ml_collections import ConfigDict
-from sklearn import metrics
 
 from jax_utils import mse_loss, value_and_multi_grad
 from model import Scalar, update_target_network
@@ -94,6 +93,7 @@ class SAC:
             apply_fn=qf.apply,
         )
         self._target_qf_params = deepcopy({"qf1": qf1_params, "qf2": qf2_params})
+        self._target_qf_params = jax_utils.replicate(self._target_qf_params)
 
         model_keys = ["policy", "qf1", "qf2"]
 
@@ -116,30 +116,20 @@ class SAC:
     def train(self, state, batch, rng):
         rng = shard_prng_key(rng)
         batch = jax.tree_map(shard, batch)
-        target_qf_params = jax_utils.replicate(self._target_qf_params)
 
-        state, metrics, rng = train_step(
-            state, rng, batch, target_qf_params, self._hashable_config, self._model_keys
+        state, metrics, rng, self._target_qf_params = train_step(
+            state,
+            rng,
+            batch,
+            self._target_qf_params,
+            self._hashable_config,
+            self._model_keys,
         )
-
-        single_state = jax_utils.unreplicate(state)
-        new_target_qf_params = {}
-        new_target_qf_params["qf1"] = update_target_network(
-            single_state["qf1"].params,
-            self._target_qf_params["qf1"],
-            self._hashable_config.soft_target_update_rate,
-        )
-        new_target_qf_params["qf2"] = update_target_network(
-            single_state["qf2"].params,
-            self._target_qf_params["qf2"],
-            self._hashable_config.soft_target_update_rate,
-        )
-        self._target_qf_params = new_target_qf_params
 
         metrics = jax_utils.unreplicate(metrics)
         rng = jax_utils.unreplicate(rng)
 
-        return state, rng, {key: val.item() for key, val in metrics.items()}
+        return state, rng, metrics
 
 
 @partial(jax.pmap, static_broadcasted_argnums=(4, 5), axis_name="batch")
@@ -154,9 +144,7 @@ def train_step(state, rng, batch, target_qf_params, train_config, model_keys):
         loss = {}
 
         rng, split_rng = jax.random.split(rng)
-        new_action, log_pi = state["policy"].apply_fn(
-            params["policy"], split_rng, obs
-        )
+        new_action, log_pi = state["policy"].apply_fn(params["policy"], split_rng, obs)
 
         if train_config.use_automatic_entropy_tuning:
             alpha_loss = (
@@ -190,12 +178,8 @@ def train_step(state, rng, batch, target_qf_params, train_config, model_keys):
             params["policy"], split_rng, next_obs
         )
         target_q_values = jnp.minimum(
-            state["qf1"].apply_fn(
-                target_qf_params["qf1"], next_obs, new_next_action
-            ),
-            state["qf2"].apply_fn(
-                target_qf_params["qf2"], next_obs, new_next_action
-            ),
+            state["qf1"].apply_fn(target_qf_params["qf1"], next_obs, new_next_action),
+            state["qf2"].apply_fn(target_qf_params["qf2"], next_obs, new_next_action),
         )
 
         if train_config.backup_entropy:
@@ -223,6 +207,18 @@ def train_step(state, rng, batch, target_qf_params, train_config, model_keys):
         for i, key in enumerate(model_keys)
     }
 
+    new_target_qf_params = {}
+    new_target_qf_params["qf1"] = update_target_network(
+        state["qf1"].params,
+        target_qf_params["qf1"],
+        train_config.soft_target_update_rate,
+    )
+    new_target_qf_params["qf2"] = update_target_network(
+        state["qf2"].params,
+        target_qf_params["qf2"],
+        train_config.soft_target_update_rate,
+    )
+
     metrics = jax.lax.pmean(
         dict(
             log_pi=aux_values["log_pi"].mean(),
@@ -238,4 +234,4 @@ def train_step(state, rng, batch, target_qf_params, train_config, model_keys):
         axis_name="batch",
     )
 
-    return state, metrics, rng
+    return state, metrics, rng, new_target_qf_params

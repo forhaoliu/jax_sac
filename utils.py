@@ -12,12 +12,12 @@ import absl.flags
 import cloudpickle as pickle
 import imageio
 import numpy as np
+import wandb
 from absl import logging
 from ml_collections import ConfigDict
 from ml_collections.config_dict import config_dict
 from ml_collections.config_flags import config_flags
 
-import wandb
 from jax_utils import init_rng
 
 

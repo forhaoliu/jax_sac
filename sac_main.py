@@ -6,12 +6,13 @@ from pathlib import Path
 
 import absl.app
 import absl.flags
+import tqdm
 import jax
 import numpy as np
+import wandb
 from dm_env import specs
 from flax import jax_utils
 
-import wandb
 from common.dmc import make
 from model import FullyConnectedQFunction, SamplerPolicy, TanhGaussianPolicy
 from replay_buffer import ReplayBufferStorage, make_replay_loader
@@ -39,6 +40,7 @@ FLAGS_DEF = define_flags_with_default(
     policy_log_std_offset=-1.0,
     n_epochs=2000001,
     n_train_step_per_epoch=1,
+    n_sample_step_per_epoch=1,
     eval_period=10000,
     eval_n_trajs=5,
     frame_stack=1,
@@ -138,19 +140,19 @@ def main(argv):
         random=True,
     )
 
-    for epoch in range(FLAGS.n_epochs):
-        print(f"epoch is {epoch}...")
+    for epoch in tqdm.tqdm(range(FLAGS.n_epochs)):
         metrics = {}
         with Timer() as rollout_timer:
-            _, rng = train_sampler.sample_step(
-                rng,
-                sampler_policy.update_params(
-                    jax_utils.unreplicate(state)["policy"].params
-                ),
-                1,
-                deterministic=False,
-                replay_storage=replay_storage,
-            )
+            for _ in range(FLAGS.n_sample_step_per_epoch):
+                _, rng = train_sampler.sample_step(
+                    rng,
+                    sampler_policy.update_params(
+                        jax_utils.unreplicate(state)["policy"].params
+                    ),
+                    1,
+                    deterministic=False,
+                    replay_storage=replay_storage,
+                )
             metrics["env_steps"] = len(replay_storage)
             metrics["epoch"] = epoch
 
@@ -178,7 +180,7 @@ def main(argv):
                     with open(log_dir / f"model_epoch_{epoch}.pkl", "wb") as fout:
                         pickle.dump(save_data, fout)
 
-        if (epoch == 0 or (epoch + 1) % FLAGS.eval_period == 0):
+        if epoch == 0 or (epoch + 1) % FLAGS.eval_period == 0:
             metrics["rollout_time"] = rollout_timer()
             metrics["train_time"] = train_timer()
             metrics["eval_time"] = eval_timer()
