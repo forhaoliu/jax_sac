@@ -125,11 +125,12 @@ class ActionRepeatWrapper(dm_env.Environment):
 
 
 class FrameStackWrapper(dm_env.Environment):
-    def __init__(self, env, num_frames, pixels_key="pixels"):
+    def __init__(self, env, num_frames, pixels_key="pixels", nchw=True):
         self._env = env
         self._num_frames = num_frames
         self._frames = deque([], maxlen=num_frames)
         self._pixels_key = pixels_key
+        self._nchw = nchw
 
         wrapped_obs_spec = env.observation_spec()
         assert pixels_key in wrapped_obs_spec
@@ -138,10 +139,16 @@ class FrameStackWrapper(dm_env.Environment):
         # remove batch dim
         if len(pixels_shape) == 4:
             pixels_shape = pixels_shape[1:]
-        self._obs_spec = specs.BoundedArray(
-            shape=np.concatenate(
+        if self._nchw:
+            shape = np.concatenate(
                 [[pixels_shape[2] * num_frames], pixels_shape[:2]], axis=0
-            ),
+            )
+        else:
+            shape = np.concatenate(
+                [pixels_shape[:2], [pixels_shape[2] * num_frames]], axis=0
+            )
+        self._obs_spec = specs.BoundedArray(
+            shape=shape,
             dtype=np.uint8,
             minimum=0,
             maximum=255,
@@ -158,7 +165,10 @@ class FrameStackWrapper(dm_env.Environment):
         # remove batch dim
         if len(pixels.shape) == 4:
             pixels = pixels[0]
-        return pixels.transpose(2, 0, 1).copy()
+        if self._nchw:
+            return pixels.transpose(2, 0, 1).copy() # PyTorch
+        else:
+            return pixels.copy() # Jax
 
     def reset(self):
         time_step = self._env.reset()
@@ -312,7 +322,7 @@ def _make_dmc(obs_type, domain, task, frame_stack, action_repeat, seed):
     return env
 
 
-def make(name, obs_type, frame_stack, action_repeat, seed):
+def make(name, obs_type, frame_stack, action_repeat, seed, nchw):
     assert obs_type in ["states", "pixels"]
     domain, task = name.split("_", 1)
     domain = dict(cup="ball_in_cup").get(domain, domain)
@@ -321,7 +331,7 @@ def make(name, obs_type, frame_stack, action_repeat, seed):
     env = make_fn(obs_type, domain, task, frame_stack, action_repeat, seed)
 
     if obs_type == "pixels":
-        env = FrameStackWrapper(env, frame_stack)
+        env = FrameStackWrapper(env, frame_stack, "pixels", nchw)
     else:
         env = ObservationDTypeWrapper(env, np.float32)
 
@@ -331,4 +341,6 @@ def make(name, obs_type, frame_stack, action_repeat, seed):
 
 
 if __name__ == "__main__":
-    pass
+    env = make("walker_stand", "pixels", 3, 2, 1, nchw=False)
+    time_step = env.reset()
+    print(env.observation_spec())

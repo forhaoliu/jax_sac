@@ -30,7 +30,7 @@ class RolloutStorage(object):
                 rng, split_rng = jax.random.split(rng)
                 action = policy(
                     split_rng,
-                    self._current_time_step["observation"].reshape(1, -1),
+                    self._current_time_step["observation"],
                     deterministic=deterministic,
                     random=random,
                 ).reshape(-1)
@@ -70,7 +70,7 @@ class RolloutStorage(object):
             rng, split_rng = jax.random.split(rng)
             action = policy(
                 split_rng,
-                self._current_time_step["observation"].reshape(1, -1),
+                self._current_time_step["observation"],
                 deterministic=deterministic,
                 random=random,
             ).reshape(-1)

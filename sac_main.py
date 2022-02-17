@@ -8,12 +8,13 @@ import absl.app
 import absl.flags
 import jax
 import numpy as np
+import tqdm
+import wandb
 from dm_env import specs
 from flax import jax_utils
 
-import wandb
 from common.dmc import make
-from model import FullyConnectedQFunction, SamplerPolicy, TanhGaussianPolicy
+from model import DoubleCritic, SamplerPolicy, TanhGaussianPolicy
 from replay_buffer import ReplayBufferStorage, make_replay_loader
 from sac import SAC
 from sampler import RolloutStorage
@@ -39,6 +40,7 @@ FLAGS_DEF = define_flags_with_default(
     policy_log_std_offset=-1.0,
     n_epochs=2000001,
     n_train_step_per_epoch=1,
+    n_sample_step_per_epoch=1,
     eval_period=10000,
     eval_n_trajs=5,
     frame_stack=1,
@@ -68,7 +70,7 @@ def main(argv):
     set_random_seed(FLAGS.seed)
 
     train_env = make(
-        FLAGS.env, FLAGS.obs_type, FLAGS.frame_stack, FLAGS.action_repeat, FLAGS.seed
+        FLAGS.env, FLAGS.obs_type, FLAGS.frame_stack, FLAGS.action_repeat, FLAGS.seed, nchw=False
     )
     test_env = make(
         FLAGS.env,
@@ -76,6 +78,7 @@ def main(argv):
         FLAGS.frame_stack,
         FLAGS.action_repeat,
         FLAGS.seed + 1000,
+        nchw=False,
     )
 
     train_sampler = RolloutStorage(train_env, FLAGS.max_traj_length)
@@ -104,19 +107,19 @@ def main(argv):
         return replay_iter
 
     dummy_env = make(
-        FLAGS.env, FLAGS.obs_type, FLAGS.frame_stack, FLAGS.action_repeat, FLAGS.seed
+        FLAGS.env, FLAGS.obs_type, FLAGS.frame_stack, FLAGS.action_repeat, FLAGS.seed, nchw=False
     )
     action_dim = dummy_env.action_spec().shape[0]
-    observation_dim = dummy_env.observation_spec().shape[0]
+    observation_dim = dummy_env.observation_spec().shape
 
     policy = TanhGaussianPolicy(
-        observation_dim,
         action_dim,
         FLAGS.policy_arch,
         FLAGS.orthogonal_init,
+        FLAGS.obs_type,
     )
-    qf = FullyConnectedQFunction(
-        observation_dim, action_dim, FLAGS.qf_arch, FLAGS.orthogonal_init
+    qf = DoubleCritic(
+        FLAGS.qf_arch, FLAGS.orthogonal_init, FLAGS.obs_type
     )
 
     if FLAGS.sac.target_entropy >= 0.0:
@@ -125,8 +128,8 @@ def main(argv):
     sac = SAC()
     sac.update_default_config(FLAGS.sac)
     rng = jax.random.PRNGKey(FLAGS.seed)
-    state, rng = sac.create_state(policy, qf, observation_dim, action_dim, rng)
-    sampler_policy = SamplerPolicy(policy, state["policy"].params)
+    state, rng = sac.create_state(policy, qf, observation_dim, action_dim, rng, FLAGS.obs_type)
+    sampler_policy = SamplerPolicy(policy, state["policy"])
 
     # wait until collecting n_worker trajectories for data loader
     _, rng = train_sampler.sample_traj(
@@ -138,19 +141,19 @@ def main(argv):
         random=True,
     )
 
-    for epoch in range(FLAGS.n_epochs):
-        print(f"epoch is {epoch}...")
+    for epoch in tqdm.tqdm(range(FLAGS.n_epochs)):
         metrics = {}
         with Timer() as rollout_timer:
-            _, rng = train_sampler.sample_step(
-                rng,
-                sampler_policy.update_params(
-                    jax_utils.unreplicate(state)["policy"].params
-                ),
-                1,
-                deterministic=False,
-                replay_storage=replay_storage,
-            )
+            for _ in range(FLAGS.n_sample_step_per_epoch):
+                _, rng = train_sampler.sample_step(
+                    rng,
+                    sampler_policy.update_params(
+                        jax_utils.unreplicate(state)["policy"].params
+                    ),
+                    1,
+                    deterministic=False,
+                    replay_storage=replay_storage,
+                )
             metrics["env_steps"] = len(replay_storage)
             metrics["epoch"] = epoch
 
@@ -178,7 +181,7 @@ def main(argv):
                     with open(log_dir / f"model_epoch_{epoch}.pkl", "wb") as fout:
                         pickle.dump(save_data, fout)
 
-        if (epoch == 0 or (epoch + 1) % FLAGS.eval_period == 0):
+        if epoch == 0 or (epoch + 1) % FLAGS.eval_period == 0:
             metrics["rollout_time"] = rollout_timer()
             metrics["train_time"] = train_timer()
             metrics["eval_time"] = eval_timer()

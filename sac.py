@@ -10,7 +10,6 @@ from flax import jax_utils
 from flax.training.common_utils import shard, shard_prng_key
 from flax.training.train_state import TrainState
 from ml_collections import ConfigDict
-from sklearn import metrics
 
 from jax_utils import mse_loss, value_and_multi_grad
 from model import Scalar, update_target_network
@@ -57,7 +56,7 @@ class SAC:
             self.config.soft_target_update_rate,
         )
 
-    def create_state(self, policy, qf, observation_dim, action_dim, rng):
+    def create_state(self, policy, qf, observation_dim, action_dim, rng, obs_type):
         state = {}
 
         optimizer_class = {
@@ -65,9 +64,12 @@ class SAC:
             "sgd": optax.sgd,
         }[self.config.optimizer_type]
 
+        dummy_obs = jnp.zeros((10, *observation_dim)) if obs_type == "states" else jnp.zeros((10, *observation_dim))
+        self._copy_encoder = False if obs_type == "states" else True
+
         rng, split_rng = jax.random.split(rng)
         policy_params = policy.init(
-            split_rng, split_rng, jnp.zeros((10, observation_dim))
+            split_rng, split_rng, dummy_obs,
         )
         state["policy"] = TrainState.create(
             params=policy_params,
@@ -76,26 +78,19 @@ class SAC:
         )
 
         rng, split_rng = jax.random.split(rng)
-        qf1_params = qf.init(
-            split_rng, jnp.zeros((10, observation_dim)), jnp.zeros((10, action_dim))
+        qf_params = qf.init(
+            split_rng, dummy_obs, jnp.zeros((10, action_dim))
         )
-        state["qf1"] = TrainState.create(
-            params=qf1_params,
-            tx=optimizer_class(self.config.qf_lr),
-            apply_fn=qf.apply,
-        )
-        rng, split_rng = jax.random.split(rng)
-        qf2_params = qf.init(
-            split_rng, jnp.zeros((10, observation_dim)), jnp.zeros((10, action_dim))
-        )
-        state["qf2"] = TrainState.create(
-            params=qf2_params,
-            tx=optimizer_class(self.config.qf_lr),
-            apply_fn=qf.apply,
-        )
-        self._target_qf_params = deepcopy({"qf1": qf1_params, "qf2": qf2_params})
 
-        model_keys = ["policy", "qf1", "qf2"]
+        state["qf"] = TrainState.create(
+            params=qf_params,
+            tx=optimizer_class(self.config.qf_lr),
+            apply_fn=qf.apply,
+        )
+        self._target_qf_params = deepcopy({"qf": qf_params})
+        self._target_qf_params = jax_utils.replicate(self._target_qf_params)
+
+        model_keys = ["policy", "qf"]
 
         if self.config.use_automatic_entropy_tuning:
             log_alpha = Scalar(0.0)
@@ -116,34 +111,25 @@ class SAC:
     def train(self, state, batch, rng):
         rng = shard_prng_key(rng)
         batch = jax.tree_map(shard, batch)
-        target_qf_params = jax_utils.replicate(self._target_qf_params)
 
-        state, metrics, rng = train_step(
-            state, rng, batch, target_qf_params, self._hashable_config, self._model_keys
+        state, metrics, rng, self._target_qf_params = train_step(
+            state,
+            rng,
+            batch,
+            self._target_qf_params,
+            self._hashable_config,
+            self._model_keys,
+            self._copy_encoder,
         )
-
-        single_state = jax_utils.unreplicate(state)
-        new_target_qf_params = {}
-        new_target_qf_params["qf1"] = update_target_network(
-            single_state["qf1"].params,
-            self._target_qf_params["qf1"],
-            self._hashable_config.soft_target_update_rate,
-        )
-        new_target_qf_params["qf2"] = update_target_network(
-            single_state["qf2"].params,
-            self._target_qf_params["qf2"],
-            self._hashable_config.soft_target_update_rate,
-        )
-        self._target_qf_params = new_target_qf_params
 
         metrics = jax_utils.unreplicate(metrics)
         rng = jax_utils.unreplicate(rng)
 
-        return state, rng, {key: val.item() for key, val in metrics.items()}
+        return state, rng, metrics
 
 
-@partial(jax.pmap, static_broadcasted_argnums=(4, 5), axis_name="batch")
-def train_step(state, rng, batch, target_qf_params, train_config, model_keys):
+@partial(jax.pmap, static_broadcasted_argnums=(4, 5, 6), axis_name="batch")
+def train_step(state, rng, batch, target_qf_params, train_config, model_keys, copy_encoder):
     def loss_fn(params, rng):
         obs = batch["obs"]
         action = batch["action"]
@@ -154,9 +140,7 @@ def train_step(state, rng, batch, target_qf_params, train_config, model_keys):
         loss = {}
 
         rng, split_rng = jax.random.split(rng)
-        new_action, log_pi = state["policy"].apply_fn(
-            params["policy"], split_rng, obs
-        )
+        new_action, log_pi = state["policy"].apply_fn(params["policy"], split_rng, obs)
 
         if train_config.use_automatic_entropy_tuning:
             alpha_loss = (
@@ -173,30 +157,20 @@ def train_step(state, rng, batch, target_qf_params, train_config, model_keys):
             alpha = train_config.alpha_multiplier
 
         """ Policy loss """
-        q_new_action = jnp.minimum(
-            state["qf1"].apply_fn(params["qf1"], obs, new_action),
-            state["qf2"].apply_fn(params["qf2"], obs, new_action),
-        )
+        q_new_action = state["qf"].apply_fn(params["qf"], obs, new_action)
         policy_loss = (alpha * log_pi - q_new_action).mean()
 
         loss["policy"] = policy_loss
 
         """ Q function loss """
-        q1_pred = state["qf1"].apply_fn(params["qf1"], obs, action)
-        q2_pred = state["qf2"].apply_fn(params["qf2"], obs, action)
+        q1_pred, q2_pred = state["qf"].apply_fn(params["qf"], obs, action)
 
         rng, split_rng = jax.random.split(rng)
         new_next_action, next_log_pi = state["policy"].apply_fn(
             params["policy"], split_rng, next_obs
         )
-        target_q_values = jnp.minimum(
-            state["qf1"].apply_fn(
-                target_qf_params["qf1"], next_obs, new_next_action
-            ),
-            state["qf2"].apply_fn(
-                target_qf_params["qf2"], next_obs, new_next_action
-            ),
-        )
+        target_q1, target_q2 = state["qf"].apply_fn(target_qf_params["qf"], next_obs, new_next_action)
+        target_q_values = jnp.minimum(target_q1, target_q2)
 
         if train_config.backup_entropy:
             target_q_values = target_q_values - alpha * next_log_pi
@@ -205,8 +179,7 @@ def train_step(state, rng, batch, target_qf_params, train_config, model_keys):
         qf1_loss = mse_loss(q1_pred, q_target)
         qf2_loss = mse_loss(q2_pred, q_target)
 
-        loss["qf1"] = qf1_loss
-        loss["qf2"] = qf2_loss
+        loss["qf"] = qf1_loss + qf2_loss
 
         return tuple(loss[key] for key in model_keys), locals()
 
@@ -223,6 +196,16 @@ def train_step(state, rng, batch, target_qf_params, train_config, model_keys):
         for i, key in enumerate(model_keys)
     }
 
+    new_target_qf_params = {}
+    new_target_qf_params["qf"] = update_target_network(
+        state["qf"].params,
+        target_qf_params["qf"],
+        train_config.soft_target_update_rate,
+    )
+
+    if copy_encoder:
+        state["policy"].params["params"].copy({"Encoder": state["qf"].params["params"]["Encoder"]})
+
     metrics = jax.lax.pmean(
         dict(
             log_pi=aux_values["log_pi"].mean(),
@@ -238,4 +221,4 @@ def train_step(state, rng, batch, target_qf_params, train_config, model_keys):
         axis_name="batch",
     )
 
-    return state, metrics, rng
+    return state, metrics, rng, new_target_qf_params

@@ -1,4 +1,5 @@
 from functools import partial
+from typing import Sequence, Tuple
 
 import distrax
 import jax
@@ -80,29 +81,82 @@ class FullyConnectedNetwork(nn.Module):
         return output
 
 
-class FullyConnectedQFunction(nn.Module):
-    observation_dim: int
-    action_dim: int
+class DoubleCriticFeature(nn.Module):
     arch: str = "256-256"
     orthogonal_init: bool = False
+    num_qf: int = 2
 
     @nn.compact
-    @multiple_action_q_function
     def __call__(self, observations, actions):
-        x = jnp.concatenate([observations, actions], axis=-1)
-        x = FullyConnectedNetwork(
-            output_dim=1, arch=self.arch, orthogonal_init=self.orthogonal_init
-        )(x)
+        x = jnp.concatenate([observations, actions], -1)
+        vmap_fc = nn.vmap(
+            FullyConnectedNetwork,
+            variable_axes={"params": 0},
+            split_rngs={"params": True},
+            in_axes=None,
+            out_axes=0,
+            axis_size=self.num_qf,
+        )
+        qs = vmap_fc(output_dim=1, arch=self.arch, orthogonal_init=self.orthogonal_init)(x)
+        return qs
+
+
+class DoubleCritic(nn.Module):
+    arch: str = "256-256"
+    orthogonal_init: bool = False
+    obs_type: str = "states"
+    cnn_features: Sequence[int] = (32, 32, 32, 32)
+    cnn_strides: Sequence[int] = (2, 1, 1, 1)
+    cnn_padding: str = "VALID"
+    latent_dim: int = 50
+
+    def setup(self):
+        if self.obs_type == "states":
+            self.encoder = Identity(name="Encoder")
+            self.projection = Identity()
+        elif self.obs_type == "pixels":
+            self.encoder = Encoder(
+                self.cnn_features,
+                self.cnn_strides,
+                self.cnn_padding,
+                name="Encoder",
+            )
+            self.projection = Projection(self.latent_dim)
+        else:
+            raise NotImplementedError
+        self.fc = DoubleCriticFeature(arch=self.arch, orthogonal_init=self.orthogonal_init)
+
+    def __call__(self, observations, actions):
+        x = self.projection(self.encoder(observations))
+        x = self.fc(x, actions)
         return jnp.squeeze(x, -1)
 
 
 class TanhGaussianPolicy(nn.Module):
-    observation_dim: int
     action_dim: int
     arch: str = "256-256"
     orthogonal_init: bool = False
+    obs_type: str = "states"
+    cnn_features: Sequence[int] = (32, 32, 32, 32)
+    cnn_strides: Sequence[int] = (2, 1, 1, 1)
+    cnn_padding: str = "VALID"
+    latent_dim: int = 50
 
     def setup(self):
+        if self.obs_type == "states":
+            self.encoder = Identity(name="Encoder")
+            self.projection = Identity()
+        elif self.obs_type == "pixels":
+            self.encoder = Encoder(
+                self.cnn_features,
+                self.cnn_strides,
+                self.cnn_padding,
+                name="Encoder",
+            )
+            self.projection = Projection(self.latent_dim)
+        else:
+            raise NotImplementedError
+
         self.base_network = FullyConnectedNetwork(
             output_dim=2 * self.action_dim,
             arch=self.arch,
@@ -112,6 +166,8 @@ class TanhGaussianPolicy(nn.Module):
     def log_prob(self, observations, actions):
         if actions.ndim == 3:
             observations = extend_and_repeat(observations, 1, actions.shape[1])
+        x = self.projection(self.encoder(observations))
+        x = jax.lax.stop_gradient(x)
         base_network_output = self.base_network(observations)
         mean, log_std = jnp.split(base_network_output, 2, axis=-1)
         log_std = nn.tanh(log_std)
@@ -126,7 +182,9 @@ class TanhGaussianPolicy(nn.Module):
     def __call__(self, rng, observations, deterministic=False, repeat=None):
         if repeat is not None:
             observations = extend_and_repeat(observations, 1, repeat)
-        base_network_output = self.base_network(observations)
+        x = self.projection(self.encoder(observations))
+        x = jax.lax.stop_gradient(x)
+        base_network_output = self.base_network(x)
         mean, log_std = jnp.split(base_network_output, 2, axis=-1)
         log_std = nn.tanh(log_std)
         log_std_min, log_std_max = -10.0, 2.0
@@ -160,7 +218,6 @@ class SamplerPolicy(object):
     def __call__(self, rng, observations, deterministic=False, random=False):
         observations = jax.device_put(observations)
         if random:
-            # actions = jnp.full_like(actions, jax.random.uniform(rng, (1,), minval=-1, maxval=1.))
             actions = jax.random.uniform(
                 rng, (1, self.policy.action_dim), minval=-1, maxval=1.0
             )
@@ -170,3 +227,47 @@ class SamplerPolicy(object):
             )
         assert jnp.all(jnp.isfinite(actions))
         return jax.device_get(actions)
+
+
+class Encoder(nn.Module):
+    features: Sequence[int] = (32, 32, 32, 32)
+    strides: Sequence[int] = (2, 1, 1, 1)
+    padding: str = "VALID"
+
+    @nn.compact
+    def __call__(self, observations: jnp.ndarray) -> jnp.ndarray:
+        assert len(self.features) == len(self.strides)
+
+        x = observations.astype(jnp.float32) / 255.0
+        for features, stride in zip(self.features, self.strides):
+            x = nn.Conv(
+                features,
+                kernel_size=(3, 3),
+                strides=(stride, stride),
+                kernel_init=jax.nn.initializers.orthogonal(1e-2),
+                padding=self.padding,
+            )(x)
+            x = nn.relu(x)
+
+        if len(x.shape) == 4:
+            x = x.reshape([x.shape[0], -1])
+        else:
+            x = x.reshape([-1])
+        return x
+
+
+class Identity(nn.Module):
+    @nn.compact
+    def __call__(self, observations):
+        return observations
+
+
+class Projection(nn.Module):
+    latent_dim: int = 50
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(self.latent_dim)(x)
+        x = nn.LayerNorm()(x)
+        x = nn.tanh(x)
+        return x
