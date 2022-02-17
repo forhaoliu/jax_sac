@@ -6,6 +6,7 @@ from pathlib import Path
 
 import absl.app
 import absl.flags
+import tqdm
 import jax
 import numpy as np
 import tqdm
