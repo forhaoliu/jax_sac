@@ -13,6 +13,7 @@ import tqdm
 import wandb
 from dm_env import specs
 from flax import jax_utils
+import torch
 
 from common.dmc import make
 from model import DoubleCritic, SamplerPolicy, TanhGaussianPolicy
@@ -197,4 +198,5 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    torch.multiprocessing.set_start_method("spawn")
     absl.app.run(main)
